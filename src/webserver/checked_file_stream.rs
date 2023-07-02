@@ -1,22 +1,24 @@
 //! Helpers and types for checking the type and extension of a file
 
-use std::task::Poll;
+use std::{path::PathBuf, task::Poll};
 
 use actix_multipart::Field;
 use derive_more::Display;
 use futures_core::Stream;
 use futures_util::TryStreamExt;
+use tracing::debug;
 
 use super::handler_err::HandlerError;
 
 /// Contains a stream of file chunks, retrieved from a request body, in addition
 /// to file type data retrieved from the reported MIME type as well as being inferred
 /// from magic numbers in the file header and a filename
+#[derive(Debug)]
 pub struct CheckedFileStream {
     inference_buf: Vec<u8>,
     buf_has_been_consumed: bool,
-    file_type: FileType,
-    base_file_name: String,
+    pub file_type: FileType,
+    pub base_file_name: String,
     field: Field,
 }
 
@@ -24,7 +26,7 @@ const INFERENCE_BUF_LEN: usize = 8192;
 
 impl CheckedFileStream {
     /// Extracts metadata from a Field struct into a new CheckedFileStream
-    async fn from_field(mut field: Field) -> Result<Self, HandlerError> {
+    pub async fn from_field(mut field: Field) -> Result<Self, HandlerError> {
         let mut inference_buf: Vec<u8> = Vec::with_capacity(INFERENCE_BUF_LEN);
         let buf_has_been_consumed: bool = false;
         let base_file_name = field
@@ -73,6 +75,12 @@ impl CheckedFileStream {
             file_type = mimed;
         }
 
+        debug!(
+            inferred_type = ?file_type,
+            file_name = base_file_name,
+            "Decoded file from multipart form"
+        );
+
         //Build struct to return
         Ok(Self {
             inference_buf,
@@ -81,6 +89,14 @@ impl CheckedFileStream {
             base_file_name,
             field,
         })
+    }
+
+    pub fn get_filename_with_extension(&self) -> PathBuf {
+        let mut name = PathBuf::from(self.base_file_name.clone());
+        if name.extension().is_none() {
+            name.set_extension(self.file_type.file_extension.clone());
+        }
+        name
     }
 }
 
@@ -93,6 +109,7 @@ impl Stream for CheckedFileStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         //If we haven't returned the inference buffer, do so first
         if !self.buf_has_been_consumed && !self.inference_buf.is_empty() {
+            self.buf_has_been_consumed = true;
             Poll::Ready(Some(Ok(bytes::Bytes::from(
                 self.as_ref().inference_buf.clone(),
             ))))
@@ -113,9 +130,9 @@ impl Stream for CheckedFileStream {
 
 #[derive(PartialEq, Eq, Debug)]
 pub struct FileType {
-    category: FileCategory,
-    mime_type: String,
-    file_extension: String,
+    pub category: FileCategory,
+    pub mime_type: String,
+    pub file_extension: String,
 }
 
 impl From<Option<infer::Type>> for FileType {

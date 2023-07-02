@@ -2,39 +2,51 @@
 
 use anyhow::Result;
 use std::{
-    fs::File,
-    io::{BufReader, Read},
-    path::PathBuf,
+    io::{BufReader, SeekFrom},
+    path::{Path, PathBuf},
 };
-use tokio::sync::OnceCell;
-use tracing::instrument;
+use tokio::{
+    fs::{File, OpenOptions},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::OnceCell,
+};
+use tracing::{debug, instrument};
 
-use actix_multipart::{
-    form::{tempfile::TempFile, MultipartForm},
-    MultipartError,
-};
+use actix_multipart::{form::MultipartForm, MultipartError};
 use actix_web::{web::Data, HttpRequest};
 use anyhow::anyhow;
 use image::DynamicImage;
 
-use super::{handler_err::HandlerError, OpenHandles};
+use super::{
+    checked_file_stream::{CheckedFileStream, FileCategory},
+    handler_err::HandlerError,
+    OpenHandles,
+};
 use crate::conf::Config;
 
 use futures_util::TryStreamExt as _;
+
+// ---------------------------------------------------------- //
+// ------------ Multipart form decoding functions ----------- //
+// ---------------------------------------------------------- //
 
 #[derive(Debug, MultipartForm)]
 #[doc(hidden)]
 pub struct ImageUploadForm {
     #[multipart(rename = "img")]
-    img_file: TempFile,
+    img_file: MaybeTempImageFile,
 }
 
 /// Wrapper for `TempFile` which allows for saving files in custom directories (helpful for
 /// bypassing cross-filesystem persist errors), as well as checking that files at least look
 /// like an image before accepting the whole thing.
-pub struct TempImageFile(File);
+#[derive(Debug)]
+pub struct MaybeTempImageFile {
+    pub f: File,
+    pub path: Option<PathBuf>,
+}
 
-impl<'t> actix_multipart::form::FieldReader<'t> for TempImageFile {
+impl<'t> actix_multipart::form::FieldReader<'t> for MaybeTempImageFile {
     type Future = futures_core::future::LocalBoxFuture<'t, Result<Self, MultipartError>>;
 
     fn read_field(
@@ -46,22 +58,36 @@ impl<'t> actix_multipart::form::FieldReader<'t> for TempImageFile {
             let config_data = req
                 .app_data::<Config>()
                 .or_else(|| req.app_data::<Data<Config>>().map(|d| d.as_ref()));
-            let file_name = field
-                .content_disposition()
-                .get_filename()
-                .map(str::to_owned)
-                .unwrap_or("unnamed_screenshot".to_string());
             let field_name = field.name().to_owned();
-            let mut size = 0;
+            let mut file_stream = CheckedFileStream::from_field(field)
+                .await
+                .map_err(HandlerError::to_multipart_err(&field_name))?;
 
             //Make sure we have configs
             if let Some(config) = config_data {
-                if let Some(tgt_file) = choose_filename(config, &file_name).await {
+                //Check file is of a valid type
+                if !check_is_allowed_type(&file_stream, config).await {
+                    return Err(HandlerError::FileWasNotAnImage(file_stream.file_type))
+                        .map_err(HandlerError::to_multipart_err(&field_name));
+                }
+
+                //Get file name with extension added if not already present
+                let file_name = file_stream.get_filename_with_extension();
+                if let Some(tgt_file) = choose_filename(config, file_name).await {
                     //If we have a local save dir configured, choose a filename manually
-                    todo!()
+                    let f = write_to_path(limits, &mut file_stream, &tgt_file)
+                        .await
+                        .map_err(HandlerError::to_multipart_err(&field_name))?;
+                    Ok(MaybeTempImageFile {
+                        f,
+                        path: Some(tgt_file),
+                    })
                 } else {
                     //Otherwise, just create a tempfile
-                    todo!()
+                    let f = write_to_new_tempfile(limits, &mut file_stream)
+                        .await
+                        .map_err(HandlerError::to_multipart_err(&field_name))?;
+                    Ok(MaybeTempImageFile { f, path: None })
                 }
             } else {
                 Err(MultipartError::Field {
@@ -76,139 +102,85 @@ impl<'t> actix_multipart::form::FieldReader<'t> for TempImageFile {
     }
 }
 
+async fn write_to_new_tempfile(
+    multipart_limits: &mut actix_multipart::form::Limits,
+    field: &mut CheckedFileStream,
+) -> Result<File, HandlerError> {
+    //Create tempfile
+    let mut f = tokio::task::spawn_blocking(move || -> Result<File, std::io::Error> {
+        let f = tempfile::tempfile()?;
+
+        //Convert to async file handle
+        Ok(File::from_std(f))
+    })
+    .await
+    .map_err(HandlerError::TokioRuntimeError)?
+    .map_err(HandlerError::FailedToWriteImage)?;
+
+    //Write data
+    write_to_file(multipart_limits, field, &mut f).await?;
+    Ok(f)
+}
+
+async fn write_to_path(
+    multipart_limits: &mut actix_multipart::form::Limits,
+    field: &mut CheckedFileStream,
+    path: impl AsRef<Path>,
+) -> Result<File, HandlerError> {
+    let mut f: File = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .open(&path)
+        .await
+        .map_err(HandlerError::FailedToWriteImage)?;
+    debug!("Writing data to path: {}", path.as_ref().display());
+    write_to_file(multipart_limits, field, &mut f).await?;
+    //Seek back to start of file once written
+    f.seek(SeekFrom::Start(0))
+        .await
+        .map_err(HandlerError::FailedToWriteImage)?;
+    //Debug
+    debug_file_handle(&mut f).await.unwrap();
+    Ok(f)
+}
+
 async fn write_to_file(
     multipart_limits: &mut actix_multipart::form::Limits,
-    max_size: u64,
-    field: &mut actix_multipart::Field,
+    field: &mut CheckedFileStream,
     tgt_file: &mut tokio::fs::File,
-) -> Result<(), MultipartError> {
-    let mut size: usize = 0;
-    let mut checked_is_image: bool = false;
-    let mut infer_buf: Vec<u8> = vec![0; 8192];
-
+) -> Result<(), HandlerError> {
+    let mut written_bytes: usize = 0;
     while let Some(chunk) = field.try_next().await? {
         multipart_limits.try_consume_limits(chunk.len(), false)?;
-        size += chunk.len();
-        //If we have enough data to attempt an infer, do so
-        if size >= 8192 {}
+        //Write chunk
+        tgt_file
+            .write_all(&chunk)
+            .await
+            .map_err(HandlerError::FailedToWriteImage)?;
+        written_bytes += chunk.len();
     }
-
-    todo!()
+    debug_file_handle(tgt_file).await;
+    debug!("Wrote {} bytes to file system", written_bytes);
+    Ok(())
 }
 
-static SUBDIR_CAPTURE_NAME: &str = "subdir";
-
-#[instrument(skip(handles))]
-/// Handler for image upload functionality.
-pub async fn upload(
-    handles: Data<OpenHandles>,
-    config: Data<Config>,
-    req: HttpRequest,
-    MultipartForm(form): MultipartForm<ImageUploadForm>,
-) -> Result<String, HandlerError> {
-    let f = form.img_file;
-
-    check_is_image(&f, &config).await?;
-    //Generate file path and save to disk if set
-    let mut saved_filename: Option<String> = None;
-    let img_reader = if let Some(filename) = f.file_name {
-        if let Some(tgt_path) = choose_filename(&config, &filename).await {
-            match f.file.persist(&tgt_path) {
-                Ok(f) => {
-                    saved_filename = Some(format!("{}", tgt_path.display()));
-                    image::io::Reader::new(BufReader::new(f))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = "Failed to write image to disk",
-                        cause = format!("{}", e.error),
-                        target_path = &tgt_path.to_string_lossy().into_owned()
-                    );
-                    //Try to reopen the original tempfile instead for copying to the clipboard
-                    image::io::Reader::new(BufReader::new(e.file.into_file()))
-                }
-            }
-        } else {
-            //We haven't saved a file to the disk for whatever reason so just use the original tempfile
-            image::io::Reader::new(BufReader::new(f.file.into_file()))
-        }
-    } else {
-        image::io::Reader::new(BufReader::new(f.file.into_file()))
-    };
-
-    //Copy image to clipboard
-    insert_file_to_clipboard(img_reader, handles, &saved_filename).await?;
-
-    //Return file location or some default value
-    match saved_filename {
-        Some(loc) => Ok(loc),
-        None => Ok("clipboard only".to_string()),
-    }
-}
-
-#[instrument(skip(handles, img_reader))]
-async fn insert_file_to_clipboard(
-    img_reader: image::io::Reader<BufReader<File>>,
-    handles: Data<OpenHandles>,
-    saved_filename: &Option<String>,
-) -> Result<(), HandlerError> {
-    //Put image into clipboard
-    let img = load_image_from_file(img_reader).await?;
-    match handles.clip_image(img).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            tracing::error!("Failed to place image into clipboard due to error {}", e);
-            Err(e.into())
-        }
-    }
-}
-
-async fn load_image_from_file(reader: image::io::Reader<BufReader<File>>) -> Result<DynamicImage> {
-    tokio::task::spawn_blocking(move || -> Result<DynamicImage> {
-        Ok(reader.with_guessed_format()?.decode()?)
-    })
-    .await?
-}
-
-async fn check_is_image(file: &TempFile, conf: &Config) -> Result<(), HandlerError> {
-    let conf = conf.clone();
-    //Open a new copy of the file
-    let mut f: File = file
-        .file
-        .reopen()
-        .map_err(HandlerError::FailedToLoadImage)?;
-
-    tokio::task::spawn_blocking(move || -> Result<(), HandlerError> {
-        //Check file size
-        let size: u64 = f.metadata().map_err(HandlerError::FailedToLoadImage)?.len();
-        if size > conf.max_image_size {
-            Err(HandlerError::FileTooLarge(size, conf.max_image_size))?
-        }
-
-        //Check file is an image
-        let limit = std::cmp::min(size as usize, 8192);
-        let mut bytes: Vec<u8> = vec![0; limit];
-        f.read_exact(&mut bytes)
-            .map_err(HandlerError::FailedToLoadImage)?;
-
-        if infer::is_image(&bytes) {
-            Ok(())
-        } else {
-            Err(HandlerError::FileWasNotAnImage(infer::get(&bytes)))
-        }
-    })
-    .await?
+async fn check_is_allowed_type(file: &CheckedFileStream, _conf: &Config) -> bool {
+    //TODO: allow changing of allowed types from configuration
+    file.file_type.category == FileCategory::Image
 }
 
 /// Choose a path a file should be saved to based on its original filename. Returns `None` if
 /// a local file path is not configured or if errors occurred when trying to ensure the directory
 /// exists.
 #[instrument]
-async fn choose_filename(config: &Config, filename: &str) -> Option<PathBuf> {
+async fn choose_filename(config: &Config, base_filename: PathBuf) -> Option<PathBuf> {
     if let Some(tgt_dir) = &config.target_dir {
+        let filename = base_filename.to_string_lossy();
         let mut tgt_dir: PathBuf = PathBuf::from(tgt_dir);
         //Add subdirectory to path if we get a regex match
-        if let Some(subdir_name) = choose_subdirectory(config, filename).await {
+        if let Some(subdir_name) = choose_subdirectory(config, &filename).await {
             tgt_dir.push(subdir_name);
         }
         //Make sure directory exists, create it if it doesn't
@@ -216,17 +188,16 @@ async fn choose_filename(config: &Config, filename: &str) -> Option<PathBuf> {
             tracing::error!(error = %e, directory = ?tgt_dir, "Failed to create nonexistant directory ");
             return None;
         }
-        let tgt_filename: PathBuf = PathBuf::from(filename);
         //If the file already exists, try appending incrementing suffixes until we find one that doesn't already exist
         let mut filename_suffix: u32 = 0;
-        let mut tgt_file = tgt_dir.join(&tgt_filename);
+        let mut tgt_file = tgt_dir.join(&base_filename);
         while tgt_file.exists() {
             let mut suffixed_filename_stem =
-                tgt_filename.file_stem().unwrap_or_default().to_os_string();
+                base_filename.file_stem().unwrap_or_default().to_os_string();
             suffixed_filename_stem.push(format!("_{}", filename_suffix));
             filename_suffix += 1;
             let mut try_filename = PathBuf::from(suffixed_filename_stem);
-            try_filename.set_extension(tgt_filename.extension().unwrap_or_default());
+            try_filename.set_extension(base_filename.extension().unwrap_or_default());
             tgt_file = tgt_dir.join(try_filename);
         }
         Some(tgt_file)
@@ -256,4 +227,68 @@ async fn choose_subdirectory(config: &Config, filename: &str) -> Option<String> 
         .and_then(|regex| regex.captures(filename))
         .and_then(|captures| captures.name(SUBDIR_CAPTURE_NAME))
         .map(|val| val.as_str().to_owned())
+}
+
+// ---------------------------------------------------------- //
+// --------------- Handler and util functions --------------- //
+// ---------------------------------------------------------- //
+
+static SUBDIR_CAPTURE_NAME: &str = "subdir";
+
+#[instrument(skip(handles))]
+/// Handler for image upload functionality.
+pub async fn upload(
+    handles: Data<OpenHandles>,
+    config: Data<Config>,
+    req: HttpRequest,
+    MultipartForm(form): MultipartForm<ImageUploadForm>,
+) -> Result<String, HandlerError> {
+    let f = form.img_file;
+
+    //Copy image to clipboard
+    insert_file_to_clipboard(f.f, handles).await?;
+
+    //Return file location or some default value
+    match f.path {
+        Some(loc) => Ok(loc.to_string_lossy().to_string()),
+        None => Ok("clipboard only".to_string()),
+    }
+}
+
+#[instrument(skip(handles, file))]
+async fn insert_file_to_clipboard(
+    file: File,
+    handles: Data<OpenHandles>,
+) -> Result<(), HandlerError> {
+    //Put image into clipboard
+    let img = load_image_from_file(file).await?;
+    match handles.clip_image(img).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::error!("Failed to place image into clipboard due to error {}", e);
+            Err(e.into())
+        }
+    }
+}
+
+async fn load_image_from_file(mut f: File) -> Result<DynamicImage> {
+    //Convert file handle to std::fs::File
+    let f: std::fs::File = f.into_std().await;
+    let reader: image::io::Reader<BufReader<std::fs::File>> =
+        image::io::Reader::new(BufReader::new(f));
+    tokio::task::spawn_blocking(move || -> Result<DynamicImage> {
+        Ok(reader.with_guessed_format()?.decode()?)
+    })
+    .await?
+}
+
+#[instrument]
+async fn debug_file_handle(mut f: &mut File) -> Result<()> {
+    let mut buf = vec![0; 64];
+    tokio::io::AsyncSeekExt::seek(&mut f, SeekFrom::Start(0)).await?;
+    f.read_buf(&mut buf).await?;
+    tracing::trace!("{:x?}", buf);
+    tokio::io::AsyncSeekExt::seek(&mut f, SeekFrom::Start(0)).await?;
+
+    Ok(())
 }

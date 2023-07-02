@@ -9,11 +9,15 @@ use yoinkx::{conf, webserver};
 #[actix_web::main]
 async fn main() {
     //Setup logging
+    let filter = tracing_subscriber::filter::EnvFilter::builder()
+        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
+        .from_env_lossy();
     let subscriber = tracing_subscriber::fmt()
         .compact()
         .with_file(true)
         .with_line_number(true)
         .pretty()
+        .with_env_filter(filter)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Failed to initialize tracing");
     tracing_log::LogTracer::init().expect("Failed to initialize log to tracing forwarder");

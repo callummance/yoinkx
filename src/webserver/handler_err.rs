@@ -1,8 +1,11 @@
 //! Error type which can be returned from webserver handler functions
 
+use actix_multipart::MultipartError;
 use actix_web::http::StatusCode;
 use anyhow::anyhow;
 use thiserror::Error;
+
+use super::checked_file_stream;
 
 #[derive(Debug, Error)]
 #[allow(missing_docs)]
@@ -15,6 +18,8 @@ pub enum HandlerError {
     CouldntOpenImageFile(std::io::Error),
     #[error("Failed to load image data due to error: {0}")]
     FailedToLoadImage(std::io::Error),
+    #[error("Failed to write image to disk")]
+    FailedToWriteImage(std::io::Error),
     #[error("Image hosting is disabled")]
     ImageHostingDisabled(),
     #[error("Illegal file path requested: {0}")]
@@ -28,7 +33,7 @@ pub enum HandlerError {
     #[error("Uploaded file size ({0}B) exceeded the maximum upload size ({1}B)")]
     FileTooLarge(u64, u64),
     #[error("Uploaded file was not an image, was instead of type {0:?}")]
-    FileWasNotAnImage(Option<infer::Type>),
+    FileWasNotAnImage(checked_file_stream::FileType),
     #[error("Failed to extract data from multipart form")]
     FieldReadError { field_name: String, cause: String },
 }
@@ -51,6 +56,7 @@ impl actix_web::error::ResponseError for HandlerError {
                 field_name: _,
                 cause: _,
             } => StatusCode::INTERNAL_SERVER_ERROR,
+            HandlerError::FailedToWriteImage(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -63,6 +69,19 @@ impl From<actix_multipart::MultipartError> for HandlerError {
                 cause: format!("{}", source),
             },
             _ => Self::InternalError(anyhow!("{}", value)),
+        }
+    }
+}
+
+impl HandlerError {
+    pub fn to_multipart_err(field_name: &str) -> impl FnOnce(HandlerError) -> MultipartError {
+        let field_name: String = field_name.to_string();
+
+        move |cause| -> MultipartError {
+            MultipartError::Field {
+                field_name,
+                source: cause.into(),
+            }
         }
     }
 }

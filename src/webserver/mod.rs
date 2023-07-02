@@ -66,7 +66,7 @@ pub async fn start(conf: crate::conf::Config) -> Result<()> {
             .app_data(clipboard_data.clone())
             .app_data(config_data.clone())
             //Add logger middleware
-            .wrap(middleware::Logger::default())
+            .wrap(tracing_actix_web::TracingLogger::default())
             //Mount routes
             .service(web::resource("/upload").to(image_upload::upload));
         //Add imagehost route if enabled
