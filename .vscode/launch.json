@@ -1,0 +1,50 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in library 'screenyeet'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--lib",
+                    "--package=yoinkx"
+                ],
+                "filter": {
+                    "name": "yoinkx",
+                    "kind": "lib"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'yoinkx'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=yoinkx",
+                    "--package=yoinkx"
+                ],
+                "filter": {
+                    "name": "yoinkx",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "env":{
+                "RUST_LOG": "trace",
+                "RUST_BACKTRACE": "0"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+    ]
+}

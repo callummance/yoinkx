@@ -8,7 +8,6 @@ pub mod imagehost;
 use std::borrow::Cow;
 
 use actix_web::{
-    middleware,
     web::{self, Data},
     App, HttpServer,
 };

@@ -74,6 +74,8 @@ impl From<actix_multipart::MultipartError> for HandlerError {
 }
 
 impl HandlerError {
+    /// Returns a function converting from a HandlerError to an actix_multipart MultipartError given the field name,
+    /// for easier use in .map_err() calls
     pub fn to_multipart_err(field_name: &str) -> impl FnOnce(HandlerError) -> MultipartError {
         let field_name: String = field_name.to_string();
 

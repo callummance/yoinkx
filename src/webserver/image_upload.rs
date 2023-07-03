@@ -7,7 +7,7 @@ use std::{
 };
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncSeekExt, AsyncWriteExt},
     sync::OnceCell,
 };
 use tracing::{debug, instrument};
@@ -42,7 +42,10 @@ pub struct ImageUploadForm {
 /// like an image before accepting the whole thing.
 #[derive(Debug)]
 pub struct MaybeTempImageFile {
+    /// Open file handle for the file we have saved our image to
     pub f: File,
+    /// If uploaded file has been saved as a tempfile, contains nothing,
+    /// otherwise holds the path the file has been saved to
     pub path: Option<PathBuf>,
 }
 
@@ -102,6 +105,7 @@ impl<'t> actix_multipart::form::FieldReader<'t> for MaybeTempImageFile {
     }
 }
 
+/// Creates a new temporary file in the default OS tempfile directory, then writes the contents of the file stream to it
 async fn write_to_new_tempfile(
     multipart_limits: &mut actix_multipart::form::Limits,
     field: &mut CheckedFileStream,
@@ -122,6 +126,8 @@ async fn write_to_new_tempfile(
     Ok(f)
 }
 
+/// Attempts to create a file at the provided path, then writes the contents of the file stream to it.
+/// If a file already exists at the provided path, it will first be truncated then overwritten
 async fn write_to_path(
     multipart_limits: &mut actix_multipart::form::Limits,
     field: &mut CheckedFileStream,
@@ -141,11 +147,11 @@ async fn write_to_path(
     f.seek(SeekFrom::Start(0))
         .await
         .map_err(HandlerError::FailedToWriteImage)?;
-    //Debug
-    debug_file_handle(&mut f).await.unwrap();
     Ok(f)
 }
 
+/// Given an async file handle and a file stream, writes the contents of the file stream to the file,
+/// observing file size limits
 async fn write_to_file(
     multipart_limits: &mut actix_multipart::form::Limits,
     field: &mut CheckedFileStream,
@@ -161,11 +167,11 @@ async fn write_to_file(
             .map_err(HandlerError::FailedToWriteImage)?;
         written_bytes += chunk.len();
     }
-    debug_file_handle(tgt_file).await;
     debug!("Wrote {} bytes to file system", written_bytes);
     Ok(())
 }
 
+/// Returns true if the provided file stream is of an allowed type
 async fn check_is_allowed_type(file: &CheckedFileStream, _conf: &Config) -> bool {
     //TODO: allow changing of allowed types from configuration
     file.file_type.category == FileCategory::Image
@@ -214,6 +220,8 @@ async fn subdir_regex(config: &Config) -> Result<&regex::Regex> {
         .map_err(anyhow::Error::from)
 }
 
+/// If configured to do so, attempts to derive the name of a subdirectory the file should be placed in,
+/// based on the filename
 async fn choose_subdirectory(config: &Config, filename: &str) -> Option<String> {
     let regex = subdir_regex(config)
         .await
@@ -256,6 +264,7 @@ pub async fn upload(
 }
 
 #[instrument(skip(handles, file))]
+/// Given an async handle to an image file, attempts to copy said file to the clipboard
 async fn insert_file_to_clipboard(
     file: File,
     handles: Data<OpenHandles>,
@@ -271,7 +280,9 @@ async fn insert_file_to_clipboard(
     }
 }
 
-async fn load_image_from_file(mut f: File) -> Result<DynamicImage> {
+/// Attempts to load an image file into memory, then parse it into a DynamicImage
+/// struct for easier use
+async fn load_image_from_file(f: File) -> Result<DynamicImage> {
     //Convert file handle to std::fs::File
     let f: std::fs::File = f.into_std().await;
     let reader: image::io::Reader<BufReader<std::fs::File>> =
@@ -280,15 +291,4 @@ async fn load_image_from_file(mut f: File) -> Result<DynamicImage> {
         Ok(reader.with_guessed_format()?.decode()?)
     })
     .await?
-}
-
-#[instrument]
-async fn debug_file_handle(mut f: &mut File) -> Result<()> {
-    let mut buf = vec![0; 64];
-    tokio::io::AsyncSeekExt::seek(&mut f, SeekFrom::Start(0)).await?;
-    f.read_buf(&mut buf).await?;
-    tracing::trace!("{:x?}", buf);
-    tokio::io::AsyncSeekExt::seek(&mut f, SeekFrom::Start(0)).await?;
-
-    Ok(())
 }
